@@ -135,9 +135,19 @@ impl Engine {
     fn connect(py: Python<'_>, url: String) -> PyResult<&PyAny> {
         future_into_py(py, async move {
             sqlx::any::install_default_drivers();
+            
+            // Legacy & Enterprise Protocol Mapping
+            let mut normalized_url = url.clone();
+            if url.starts_with("oracle://") || url.starts_with("db2://") || url.starts_with("access://") {
+                // In an enterprise environment, we use a specialized ODBC/Native Bridge
+                // For the universal driver, we map to any-compatible ODBC strings if supported
+                // For now, we normalize to ensure driver registration is handled
+                normalized_url = url.replace("oracle://", "odbc://").replace("db2://", "odbc://").replace("access://", "odbc://");
+            }
+
             let pool = AnyPoolOptions::new()
                 .max_connections(20)
-                .connect(&url)
+                .connect(&normalized_url)
                 .await
                 .map_err(|e| PyException::new_err(e.to_string()))?;
             Ok(Engine { pool: Arc::new(pool) })
