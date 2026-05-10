@@ -14,6 +14,7 @@ pub enum ShardingStrategyType {
     Geo,
     List,
     Directory,
+    Custom,
 }
 
 #[pyclass]
@@ -24,6 +25,7 @@ pub struct ShardingConfig {
     pub geo_map: HashMap<String, String>,
     pub list_map: HashMap<String, String>,
     pub directory_url: Option<String>,
+    pub custom_callback: Option<PyObject>,
 }
 
 #[pymethods]
@@ -36,6 +38,7 @@ impl ShardingConfig {
             geo_map: HashMap::new(),
             list_map: HashMap::new(),
             directory_url: None,
+            custom_callback: None,
         }
     }
 
@@ -53,6 +56,10 @@ impl ShardingConfig {
 
     fn set_directory(&mut self, url: String) {
         self.directory_url = Some(url);
+    }
+
+    fn set_custom(&mut self, callback: PyObject) {
+        self.custom_callback = Some(callback);
     }
 }
 
@@ -75,17 +82,26 @@ impl Cluster {
     fn add_shard(&mut self, _name: String, _url: String) {
     }
 
-    fn route(&self, value: String) -> String {
+    fn route(&self, py: Python<'_>, value: String) -> PyResult<String> {
         let config = &self.config;
         match config.strategy {
+            ShardingStrategyType::Custom => {
+                if let Some(callback) = &config.custom_callback {
+                    let res = callback.call1(py, (value,))?;
+                    let shard: String = res.extract(py)?;
+                    Ok(shard)
+                } else {
+                    Err(PyException::new_err("Custom strategy selected but no callback provided"))
+                }
+            }
             ShardingStrategyType::Hash => {
                 let hash = md5::compute(value);
                 let shards: Vec<_> = self.pools.keys().collect();
-                if shards.is_empty() { return "default".to_string(); }
-                shards[(hash[0] as usize) % shards.len()].clone()
+                if shards.is_empty() { return Ok("default".to_string()); }
+                Ok(shards[(hash[0] as usize) % shards.len()].clone())
             }
             ShardingStrategyType::Geo => {
-                config.geo_map.get(&value).cloned().unwrap_or_else(|| "default".to_string())
+                Ok(config.geo_map.get(&value).cloned().unwrap_or_else(|| "default".to_string()))
             }
             ShardingStrategyType::Range => {
                 let val: i64 = value.parse().unwrap_or(0);
@@ -93,16 +109,16 @@ impl Cluster {
                 sorted_keys.sort();
                 for k in sorted_keys {
                     if val <= k {
-                        return config.range_map.get(&k).unwrap().clone();
+                        return Ok(config.range_map.get(&k).unwrap().clone());
                     }
                 }
-                "default".to_string()
+                Ok("default".to_string())
             }
             ShardingStrategyType::List => {
-                config.list_map.get(&value).cloned().unwrap_or_else(|| "default".to_string())
+                Ok(config.list_map.get(&value).cloned().unwrap_or_else(|| "default".to_string()))
             }
             ShardingStrategyType::Directory => {
-                "default".to_string()
+                Ok("default".to_string())
             }
         }
     }
