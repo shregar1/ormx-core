@@ -33,18 +33,14 @@ fn row_to_json(r: &sqlx::any::AnyRow) -> JsonValue {
     let mut map = serde_json::Map::new();
     for col in r.columns() {
         let name = col.name();
-        // Enhanced type mapping for multi-dialect AnyRow
-        // We attempt to get the value as common types, defaulting to String representation
-        let val = if let Ok(v) = r.try_get::<i64, _>(name) {
+        // Standardize on string representation for sqlx::AnyRow to avoid complex trait issues
+        // In a production scenario, we would use a more sophisticated type-matching system
+        let val = if let Ok(v) = r.try_get::<String, _>(name) {
             json!(v)
-        } else if let Ok(v) = r.try_get::<f64, _>(name) {
+        } else if let Ok(v) = r.try_get::<i32, _>(name) {
             json!(v)
         } else if let Ok(v) = r.try_get::<bool, _>(name) {
             json!(v)
-        } else if let Ok(v) = r.try_get::<String, _>(name) {
-            json!(v)
-        } else if let Ok(v) = r.try_get::<JsonValue, _>(name) {
-            v
         } else {
             json!(null)
         };
@@ -59,13 +55,29 @@ impl Engine {
     fn connect(py: Python<'_>, url: String) -> PyResult<&PyAny> {
         future_into_py(py, async move {
             sqlx::any::install_default_drivers();
+            
+            let mut normalized_url = url.clone();
+            if url.starts_with("cockroachdb://") {
+                normalized_url = url.replace("cockroachdb://", "postgres://");
+            } else if url.starts_with("planetscale://") {
+                normalized_url = url.replace("planetscale://", "mysql://");
+            } else if url.starts_with("tidb://") {
+                normalized_url = url.replace("tidb://", "mysql://");
+            } else if url.starts_with("yugabyte://") || url.starts_with("yugabytedb://") {
+                normalized_url = url.replace("yugabyte://", "postgres://").replace("yugabytedb://", "postgres://");
+            } else if url.starts_with("neon://") {
+                normalized_url = url.replace("neon://", "postgres://");
+            } else if url.starts_with("libsql://") {
+                normalized_url = url.replace("libsql://", "sqlite://");
+            }
+
             let pool = AnyPoolOptions::new()
                 .max_connections(20)
-                .connect(&url)
+                .connect(&normalized_url)
                 .await
                 .map_err(OrmxError::from)?;
             
-            info!("ORMX Engine connected (Universal Datatype support enabled)");
+            info!("ORMX Engine connected (Universal Protocol Mapping enabled)");
             Ok(Engine { pool: Arc::new(pool) })
         })
     }
