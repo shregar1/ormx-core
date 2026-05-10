@@ -1,10 +1,12 @@
-use pyo3::exceptions::{PyException, PyRuntimeError};
+use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_asyncio::tokio::future_into_py;
 use sqlx::{postgres::PgPoolOptions, PgPool, Pool, Postgres, Row, Column, Transaction as SqlxTransaction};
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tracing::{info, error, warn};
 
 #[derive(Error, Debug)]
 pub enum OrmxError {
@@ -12,11 +14,26 @@ pub enum OrmxError {
     Database(#[from] sqlx::Error),
     #[error("Engine error: {0}")]
     Engine(String),
+    #[error("Not found")]
+    NotFound,
 }
 
 impl From<OrmxError> for PyErr {
     fn from(err: OrmxError) -> PyErr {
-        PyException::new_err(err.to_string())
+        match err {
+            OrmxError::Database(e) => {
+                let msg = e.to_string();
+                if msg.contains("unique constraint") {
+                    PyException::new_err(format!("IntegrityError: {}", msg))
+                } else if msg.contains("foreign key") {
+                    PyException::new_err(format!("IntegrityError: {}", msg))
+                } else {
+                    PyException::new_err(format!("QueryError: {}", msg))
+                }
+            }
+            OrmxError::NotFound => PyException::new_err("NotFoundError: Record not found"),
+            OrmxError::Engine(s) => PyRuntimeError::new_err(s),
+        }
     }
 }
 
@@ -41,21 +58,15 @@ impl Engine {
                 .await
                 .map_err(OrmxError::from)?;
             
+            info!("ORMX Engine connected to database");
             Ok(Engine { pool: Arc::new(pool) })
-        })
-    }
-
-    fn begin<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
-        let pool = self.pool.clone();
-        future_into_py(py, async move {
-            let tx = pool.begin().await.map_err(OrmxError::from)?;
-            Ok(Transaction { tx: Arc::new(Mutex::new(Some(tx))) })
         })
     }
 
     fn execute<'p>(&self, py: Python<'p>, sql: String, params: Option<Vec<PyObject>>) -> PyResult<&'p PyAny> {
         let pool = self.pool.clone();
         future_into_py(py, async move {
+            let start = Instant::now();
             let mut query = sqlx::query(&sql);
             if let Some(p) = params {
                 for param in p {
@@ -66,6 +77,12 @@ impl Engine {
                 }
             }
             let result = query.execute(&*pool).await.map_err(OrmxError::from)?;
+            let duration = start.elapsed();
+            
+            if duration.as_millis() > 100 {
+                warn!(sql = %sql, duration = ?duration, "Slow query detected");
+            }
+            
             Ok(result.rows_affected())
         })
     }
@@ -73,13 +90,25 @@ impl Engine {
     fn fetch_one<'p>(&self, py: Python<'p>, sql: String) -> PyResult<&'p PyAny> {
         let pool = self.pool.clone();
         future_into_py(py, async move {
-            let row = sqlx::query(&sql).fetch_one(&*pool).await.map_err(OrmxError::from)?;
-            let mut map = std::collections::HashMap::new();
-            for col in row.columns() {
-                let val: String = row.try_get(col.name()).unwrap_or_else(|_| "null".to_string());
-                map.insert(col.name().to_string(), val);
+            let start = Instant::now();
+            let row = sqlx::query(&sql).fetch_optional(&*pool).await.map_err(OrmxError::from)?;
+            let duration = start.elapsed();
+            
+            if duration.as_millis() > 100 {
+                warn!(sql = %sql, duration = ?duration, "Slow query detected");
             }
-            Ok(serde_json::to_string(&map).unwrap())
+
+            match row {
+                Some(r) => {
+                    let mut map = std::collections::HashMap::new();
+                    for col in r.columns() {
+                        let val: String = r.try_get(col.name()).unwrap_or_else(|_| "null".to_string());
+                        map.insert(col.name().to_string(), val);
+                    }
+                    Ok(serde_json::to_string(&map).unwrap())
+                }
+                None => Err(OrmxError::NotFound.into()),
+            }
         })
     }
 }
@@ -92,6 +121,7 @@ impl Transaction {
             let mut tx_opt = tx_mutex.lock().await;
             if let Some(tx) = tx_opt.take() {
                 tx.commit().await.map_err(OrmxError::from)?;
+                info!("Transaction committed");
                 Ok(())
             } else {
                 Err(OrmxError::Engine("Transaction already finalized".into()).into())
@@ -105,6 +135,7 @@ impl Transaction {
             let mut tx_opt = tx_mutex.lock().await;
             if let Some(tx) = tx_opt.take() {
                 tx.rollback().await.map_err(OrmxError::from)?;
+                warn!("Transaction rolled back");
                 Ok(())
             } else {
                 Err(OrmxError::Engine("Transaction already finalized".into()).into())
