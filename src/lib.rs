@@ -154,20 +154,48 @@ impl Engine {
         })
     }
 
-    fn fetch_many<'p>(&self, py: Python<'p>, sql: String) -> PyResult<&'p PyAny> {
+    fn fetch_many<'p>(&self, py: Python<'p>, sql: String, params: Vec<String>) -> PyResult<&'p PyAny> {
         let pool = self.pool.clone();
         future_into_py(py, async move {
-            let rows = sqlx::query(&sql).fetch_all(&*pool).await.map_err(|e| PyException::new_err(e.to_string()))?;
+            let mut query = sqlx::query(&sql);
+            for p in params {
+                query = query.bind(p);
+            }
+            let rows = query.fetch_all(&*pool).await.map_err(|e| PyException::new_err(e.to_string()))?;
             let mut results = Vec::new();
             for r in rows {
-                let mut map = HashMap::new();
+                let mut map = serde_json::Map::new();
                 for col in r.columns() {
-                    let val: String = r.try_get(col.name()).unwrap_or_else(|_| "null".to_string());
-                    map.insert(col.name().to_string(), val);
+                    let name = col.name();
+                    // Try to get as i64, then String, then fallback to null
+                    let val = if let Ok(v) = r.try_get::<i64, _>(name) {
+                        json!(v)
+                    } else if let Ok(v) = r.try_get::<String, _>(name) {
+                        json!(v)
+                    } else if let Ok(v) = r.try_get::<f64, _>(name) {
+                        json!(v)
+                    } else if let Ok(v) = r.try_get::<bool, _>(name) {
+                        json!(v)
+                    } else {
+                        JsonValue::Null
+                    };
+                    map.insert(name.to_string(), val);
                 }
-                results.push(map);
+                results.push(JsonValue::Object(map));
             }
             Ok(serde_json::to_string(&results).unwrap())
+        })
+    }
+
+    fn execute<'p>(&self, py: Python<'p>, sql: String, params: Vec<String>) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            let mut query = sqlx::query(&sql);
+            for p in params {
+                query = query.bind(p);
+            }
+            query.execute(&*pool).await.map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(())
         })
     }
 }
