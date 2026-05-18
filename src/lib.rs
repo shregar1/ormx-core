@@ -1,10 +1,101 @@
 use pyo3::exceptions::{PyException};
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 use pyo3_asyncio::tokio::future_into_py;
-use sqlx::{Row, Column, any::AnyPoolOptions, AnyPool};
+use sqlx::{Row, Column, TypeInfo, postgres::{PgPool, PgPoolOptions}};
 use std::sync::Arc;
 use std::collections::HashMap;
-use serde_json::{Value as JsonValue, json};
+
+pub mod logic;
+
+/// Typed parameter value extracted from a Python object once, so the async
+/// bind loop doesn't need to reacquire the GIL. Owned variants only — moved
+/// into sqlx's `bind` by value (no clones).
+#[derive(Debug, Clone)]
+enum TypedParam {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Real(f64),
+    Text(String),
+}
+
+fn extract_param(obj: &PyAny) -> PyResult<TypedParam> {
+    if obj.is_none() {
+        return Ok(TypedParam::Null);
+    }
+    // bool BEFORE int — Python bools are an int subclass and would otherwise
+    // coerce to 0/1.
+    if let Ok(b) = obj.extract::<bool>() {
+        return Ok(TypedParam::Bool(b));
+    }
+    if let Ok(i) = obj.extract::<i64>() {
+        return Ok(TypedParam::Int(i));
+    }
+    if let Ok(f) = obj.extract::<f64>() {
+        return Ok(TypedParam::Real(f));
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(TypedParam::Text(s));
+    }
+    // Decimal, datetime, UUID, etc. fall through here. str() gives a sensible
+    // wire-format the server can cast (ISO 8601, decimal string, hex UUID).
+    Ok(TypedParam::Text(obj.str()?.to_str()?.to_owned()))
+}
+
+/// Decode one column of a row into a Python-native value, picking the right
+/// `try_get` once based on the column's declared SQL type. Falls back to a
+/// probe sequence for unrecognized types (TIMESTAMP, DECIMAL, UUID …).
+fn decode_col(py: Python<'_>, row: &sqlx::postgres::PgRow, name: &str, type_name: &str) -> Py<PyAny> {
+    // Postgres is strictly typed — try_get won't widen INT4→i64 the way
+    // sqlx::Any did, so each PG numeric width gets its own arm and widens
+    // explicitly on the Rust side.
+    match type_name {
+        "BOOL" => row.try_get::<Option<bool>, _>(name).ok().flatten().into_py(py),
+        "INT2" => row
+            .try_get::<Option<i16>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| v as i64)
+            .into_py(py),
+        "INT4" => row
+            .try_get::<Option<i32>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| v as i64)
+            .into_py(py),
+        "INT8" => row.try_get::<Option<i64>, _>(name).ok().flatten().into_py(py),
+        "FLOAT4" => row
+            .try_get::<Option<f32>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| v as f64)
+            .into_py(py),
+        "FLOAT8" => row.try_get::<Option<f64>, _>(name).ok().flatten().into_py(py),
+        "TEXT" | "VARCHAR" | "CHAR" | "CITEXT" | "NAME" | "BPCHAR" => row
+            .try_get::<Option<String>, _>(name)
+            .ok()
+            .flatten()
+            .into_py(py),
+        _ => {
+            // Slow path for unrecognised types (TIMESTAMP, NUMERIC, UUID, JSONB…).
+            // Widen to String last so date/uuid/etc surface as ISO strings.
+            if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(name) {
+                v.into_py(py)
+            } else if let Ok(Some(v)) = row.try_get::<Option<i32>, _>(name) {
+                (v as i64).into_py(py)
+            } else if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(name) {
+                v.into_py(py)
+            } else if let Ok(Some(v)) = row.try_get::<Option<bool>, _>(name) {
+                v.into_py(py)
+            } else if let Ok(Some(v)) = row.try_get::<Option<String>, _>(name) {
+                v.into_py(py)
+            } else {
+                py.None()
+            }
+        }
+    }
+}
 
 #[pyclass]
 #[derive(Clone, Copy)]
@@ -26,6 +117,10 @@ pub struct ShardingConfig {
     pub list_map: HashMap<String, String>,
     pub directory_url: Option<String>,
     pub custom_callback: Option<PyObject>,
+    /// Cached sort of `range_map.keys()`, kept fresh by `set_range` so the
+    /// hot routing path is an O(log n) `partition_point` lookup instead of a
+    /// per-call O(n log n) sort.
+    range_sorted_keys: Vec<i64>,
 }
 
 #[pymethods]
@@ -39,11 +134,21 @@ impl ShardingConfig {
             list_map: HashMap::new(),
             directory_url: None,
             custom_callback: None,
+            range_sorted_keys: Vec::new(),
         }
     }
 
     fn set_range(&mut self, upper_bound: i64, shard: String) {
+        let is_new = !self.range_map.contains_key(&upper_bound);
         self.range_map.insert(upper_bound, shard);
+        if is_new {
+            // Maintain sorted invariant with a single insert at the correct
+            // position — no full re-sort.
+            match self.range_sorted_keys.binary_search(&upper_bound) {
+                Ok(_) => {} // already present (shouldn't happen given the guard above)
+                Err(pos) => self.range_sorted_keys.insert(pos, upper_bound),
+            }
+        }
     }
 
     fn set_geo(&mut self, region: String, shard: String) {
@@ -65,7 +170,7 @@ impl ShardingConfig {
 
 #[pyclass]
 pub struct Cluster {
-    pools: Arc<HashMap<String, AnyPool>>,
+    pools: Arc<HashMap<String, PgPool>>,
     config: ShardingConfig,
 }
 
@@ -95,38 +200,24 @@ impl Cluster {
                 }
             }
             ShardingStrategyType::Hash => {
-                let hash = md5::compute(value);
-                let shards: Vec<_> = self.pools.keys().collect();
-                if shards.is_empty() { return Ok("default".to_string()); }
-                Ok(shards[(hash[0] as usize) % shards.len()].clone())
+                let shards: Vec<String> = self.pools.keys().cloned().collect();
+                Ok(logic::route_hash(&value, &shards))
             }
-            ShardingStrategyType::Geo => {
-                Ok(config.geo_map.get(&value).cloned().unwrap_or_else(|| "default".to_string()))
-            }
-            ShardingStrategyType::Range => {
-                let val: i64 = value.parse().unwrap_or(0);
-                let mut sorted_keys: Vec<_> = config.range_map.keys().cloned().collect();
-                sorted_keys.sort();
-                for k in sorted_keys {
-                    if val <= k {
-                        return Ok(config.range_map.get(&k).unwrap().clone());
-                    }
-                }
-                Ok("default".to_string())
-            }
-            ShardingStrategyType::List => {
-                Ok(config.list_map.get(&value).cloned().unwrap_or_else(|| "default".to_string()))
-            }
-            ShardingStrategyType::Directory => {
-                Ok("default".to_string())
-            }
+            ShardingStrategyType::Geo => Ok(logic::route_geo(&value, &config.geo_map)),
+            ShardingStrategyType::Range => Ok(logic::route_range_sorted(
+                &value,
+                &config.range_sorted_keys,
+                &config.range_map,
+            )),
+            ShardingStrategyType::List => Ok(logic::route_list(&value, &config.list_map)),
+            ShardingStrategyType::Directory => Ok(logic::DEFAULT_SHARD.to_string()),
         }
     }
 }
 
 #[pyclass]
 pub struct Engine {
-    pool: Arc<sqlx::AnyPool>,
+    pool: Arc<PgPool>,
 }
 
 #[pymethods]
@@ -134,67 +225,95 @@ impl Engine {
     #[staticmethod]
     fn connect(py: Python<'_>, url: String) -> PyResult<&PyAny> {
         future_into_py(py, async move {
-            sqlx::any::install_default_drivers();
-            
-            // Legacy & Enterprise Protocol Mapping
-            let mut normalized_url = url.clone();
-            if url.starts_with("oracle://") || url.starts_with("db2://") || url.starts_with("access://") {
-                // In an enterprise environment, we use a specialized ODBC/Native Bridge
-                // For the universal driver, we map to any-compatible ODBC strings if supported
-                // For now, we normalize to ensure driver registration is handled
-                normalized_url = url.replace("oracle://", "odbc://").replace("db2://", "odbc://").replace("access://", "odbc://");
-            }
-
-            let pool = AnyPoolOptions::new()
+            // Postgres-native pool: skips sqlx::Any's vtable dispatch on every
+            // bind and decode. The wire protocol path is now type-specialised
+            // at compile time, putting us roughly at asyncpg latency.
+            let pool = PgPoolOptions::new()
                 .max_connections(20)
-                .connect(&normalized_url)
+                .connect(&url)
                 .await
                 .map_err(|e| PyException::new_err(e.to_string()))?;
             Ok(Engine { pool: Arc::new(pool) })
         })
     }
 
-    fn fetch_many<'p>(&self, py: Python<'p>, sql: String, params: Vec<String>) -> PyResult<&'p PyAny> {
+    fn fetch_many<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        // Extract typed params under the GIL we already hold — avoids
+        // reacquiring it inside the async block, and lets sqlx see real types
+        // (int → INT, bool → BOOL, etc.) instead of widening everything to
+        // TEXT the way the old `Vec<String>` signature did.
+        let typed_params: Vec<TypedParam> = params
+            .iter()
+            .map(|p| extract_param(p.as_ref(py)))
+            .collect::<PyResult<_>>()?;
+
         let pool = self.pool.clone();
         future_into_py(py, async move {
             let mut query = sqlx::query(&sql);
-            for p in params {
-                query = query.bind(p);
+            for p in typed_params {
+                query = match p {
+                    TypedParam::Null => query.bind(Option::<String>::None),
+                    TypedParam::Bool(b) => query.bind(b),
+                    TypedParam::Int(i) => query.bind(i),
+                    TypedParam::Real(f) => query.bind(f),
+                    TypedParam::Text(s) => query.bind(s),
+                };
             }
-            let rows = query.fetch_all(&*pool).await.map_err(|e| PyException::new_err(e.to_string()))?;
-            let mut results = Vec::new();
-            for r in rows {
-                let mut map = serde_json::Map::new();
-                for col in r.columns() {
-                    let name = col.name();
-                    // Try to get as i64, then String, then fallback to null
-                    let val = if let Ok(v) = r.try_get::<i64, _>(name) {
-                        json!(v)
-                    } else if let Ok(v) = r.try_get::<String, _>(name) {
-                        json!(v)
-                    } else if let Ok(v) = r.try_get::<f64, _>(name) {
-                        json!(v)
-                    } else if let Ok(v) = r.try_get::<bool, _>(name) {
-                        json!(v)
-                    } else {
-                        JsonValue::Null
-                    };
-                    map.insert(name.to_string(), val);
+            let rows = query
+                .fetch_all(&*pool)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+
+            // Build a Python `list[dict]` directly — no JSON encode here, no
+            // matching `json.loads()` on the Python side.
+            Python::with_gil(|py| -> PyResult<Py<PyAny>> {
+                let out = PyList::empty(py);
+                for r in &rows {
+                    let dict = PyDict::new(py);
+                    for col in r.columns() {
+                        let name = col.name();
+                        let type_name = col.type_info().name();
+                        dict.set_item(name, decode_col(py, r, name, type_name))?;
+                    }
+                    out.append(dict)?;
                 }
-                results.push(JsonValue::Object(map));
-            }
-            Ok(serde_json::to_string(&results).unwrap())
+                Ok(out.into())
+            })
         })
     }
 
-    fn execute<'p>(&self, py: Python<'p>, sql: String, params: Vec<String>) -> PyResult<&'p PyAny> {
+    fn execute<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params: Vec<TypedParam> = params
+            .iter()
+            .map(|p| extract_param(p.as_ref(py)))
+            .collect::<PyResult<_>>()?;
+
         let pool = self.pool.clone();
         future_into_py(py, async move {
             let mut query = sqlx::query(&sql);
-            for p in params {
-                query = query.bind(p);
+            for p in typed_params {
+                query = match p {
+                    TypedParam::Null => query.bind(Option::<String>::None),
+                    TypedParam::Bool(b) => query.bind(b),
+                    TypedParam::Int(i) => query.bind(i),
+                    TypedParam::Real(f) => query.bind(f),
+                    TypedParam::Text(s) => query.bind(s),
+                };
             }
-            query.execute(&*pool).await.map_err(|e| PyException::new_err(e.to_string()))?;
+            query
+                .execute(&*pool)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
             Ok(())
         })
     }
