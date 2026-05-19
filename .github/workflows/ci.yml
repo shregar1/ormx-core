@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+# Don't run two CI workflows for the same SHA on a PR that's also a push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo test + clippy + fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo test (logic + non-PyO3 paths)
+        # Skip features that need the Python ABI — the wheel build
+        # below covers the PyO3 surface end-to-end.
+        run: cargo test --no-default-features
+
+  # Verifies the Python wheel actually builds on every commit. Doesn't
+  # publish — that's release.yml's job on tag push.
+  wheel-smoke:
+    name: maturin build (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install maturin
+      - name: maturin build (dev profile, abi3)
+        run: maturin build --out dist
+      - name: verify wheel imports
+        run: |
+          pip install --force-reinstall --no-deps dist/*.whl
+          python -c "import ormx_core; print('Engine:', dir(ormx_core.Engine))"

@@ -1,0 +1,151 @@
+name: Release
+
+# Triggers on every ``v*`` tag push — see RELEASING.md for the full
+# flow. The same workflow also supports ``workflow_dispatch`` so a
+# maintainer can rerun the publish (e.g. if PyPI throttled).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# One release at a time, no overlapping uploads.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  # ``id-token: write`` is the prerequisite for PyPI trusted publishing
+  # (no API tokens stored in CI secrets). The PyPI project needs a
+  # trusted publisher configured against this repo + workflow filename.
+  id-token: write
+  contents: read
+
+jobs:
+  # ── one wheel per platform/arch, all abi3-py37 so a single wheel
+  # covers Python 3.7 through 3.13+ on that target ─────────────────
+  wheels:
+    name: wheel ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux — manylinux container handles the ABI compat
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+          # macOS
+          - os: macos-13           # Intel runner
+            target: x86_64-apple-darwin
+          - os: macos-14           # Apple silicon runner
+            target: aarch64-apple-darwin
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Build wheel via maturin-action
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # ``--release`` is added automatically by the action when
+          # command=build. ``--strip`` drops debug symbols (smaller
+          # wheels). The ``manylinux`` arg only applies on Linux.
+          args: --release --strip --out dist
+          manylinux: ${{ matrix.manylinux }}
+          sccache: "true"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+
+  # ── source distribution (one per release; lets sdist-from-source
+  # fallback work for any uncommon platform) ───────────────────────
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # ── single publish step pulls every artifact and uploads to PyPI ─
+  publish:
+    name: publish to PyPI
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    # Restrict to tag pushes — manual ``workflow_dispatch`` runs build
+    # wheels but skip publish (safer; rerun the dispatch + add the env
+    # name manually if you really want to re-publish).
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: pypi  # configure the trusted publisher against this env
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -lah dist/
+      - name: Publish via trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # ``packages-dir`` defaults to ``dist/``. No password / token
+          # because trusted-publishing OIDC handles auth.
+          skip-existing: true
+          verbose: true
+
+  # ── create a GitHub Release with the tag's annotated message + the
+  # wheel/sdist artifacts attached ─────────────────────────────────
+  github-release:
+    name: GitHub Release
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          # ``${{ github.ref_name }}`` is the tag (e.g. ``v0.2.0``).
+          # We attach every built artifact so users can pull a
+          # platform-specific wheel directly from the release page.
+          files: dist/*
+          # ``generate_release_notes: true`` builds a changelog from
+          # the commit log since the previous tag — useful for the
+          # release page even though the actual release notes live
+          # in the tag's annotated message.
+          generate_release_notes: true
+          body: |
+            See the [tag annotation](https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}) for the full release notes.
+
+            Wheels for every supported platform are attached. To install:
+
+            ```bash
+            pip install ormx-core==${{ github.ref_name }}
+            ```
