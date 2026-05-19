@@ -748,6 +748,404 @@ impl SqliteEngine {
             Ok(total)
         })
     }
+
+    /// Begin a transaction. Returns a [`SqliteTransaction`].
+    ///
+    /// SQLite serialises writes (one writer at a time, the file is
+    /// the lock domain), so transactional contention surfaces as
+    /// ``database is locked`` errors rather than the deadlock + retry
+    /// loop PG offers. Use sparingly; most SQLite workloads work fine
+    /// with autocommit.
+    fn begin<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            let tx = pool
+                .begin()
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(SqliteTransaction {
+                inner: Arc::new(TokioMutex::new(Some(tx))),
+            })
+        })
+    }
+}
+
+/// SQLite-side transaction handle. Same shape as :class:`Transaction`
+/// but for ``sqlx::Sqlite``.
+#[pyclass]
+pub struct SqliteTransaction {
+    inner: Arc<TokioMutex<Option<sqlx::Transaction<'static, sqlx::Sqlite>>>>,
+}
+
+#[pymethods]
+impl SqliteTransaction {
+    fn commit<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            if let Some(tx) = guard.take() {
+                tx.commit()
+                    .await
+                    .map_err(|e| PyException::new_err(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn rollback<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            if let Some(tx) = guard.take() {
+                tx.rollback()
+                    .await
+                    .map_err(|e| PyException::new_err(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn fetch_many<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PyException::new_err(
+                    "Transaction already committed or rolled back; cannot fetch_many",
+                )
+            })?;
+            let query = bind_typed_sqlite(sqlx::query(&sql), typed_params);
+            let rows = query
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Python::with_gil(|py| sqlite_rows_to_py_list(py, &rows))
+        })
+    }
+
+    fn execute<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PyException::new_err(
+                    "Transaction already committed or rolled back; cannot execute",
+                )
+            })?;
+            let query = bind_typed_sqlite(sqlx::query(&sql), typed_params);
+            let result = query
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(result.rows_affected())
+        })
+    }
+
+    fn execute_many<'p>(&self, py: Python<'p>, sql: String) -> PyResult<&'p PyAny> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PyException::new_err(
+                    "Transaction already committed or rolled back; cannot execute_many",
+                )
+            })?;
+            use futures::TryStreamExt;
+            use sqlx::Executor;
+            let mut total: u64 = 0;
+            let mut stream = (&mut **tx).execute_many(sqlx::raw_sql(&sql));
+            while let Some(result) = stream
+                .try_next()
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?
+            {
+                total += result.rows_affected();
+            }
+            Ok(total)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MySQL backend
+// ---------------------------------------------------------------------------
+//
+// Same pattern as Postgres + SQLite — separate ``MySqlEngine`` PyClass
+// wrapping ``sqlx::MySql``. MySQL placeholders are ``?`` (same as
+// SQLite); decode probes integer / float / bool / string / bytes in
+// that order.
+
+use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
+
+fn decode_col_mysql(py: Python<'_>, row: &MySqlRow, name: &str) -> Py<PyAny> {
+    // MySQL is typed, but the sqlx column-type-name surface isn't as
+    // uniform as Postgres'. Probe in the same descending-specificity
+    // order as SQLite, with String before Vec<u8> so VARCHAR/TEXT
+    // columns come back as ``str`` rather than ``bytes``.
+    if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(name) {
+        return v.into_py(py);
+    }
+    if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(name) {
+        return v.into_py(py);
+    }
+    if let Ok(Some(v)) = row.try_get::<Option<bool>, _>(name) {
+        return v.into_py(py);
+    }
+    if let Ok(Some(v)) = row.try_get::<Option<String>, _>(name) {
+        return v.into_py(py);
+    }
+    if let Ok(Some(v)) = row.try_get::<Option<Vec<u8>>, _>(name) {
+        return pyo3::types::PyBytes::new(py, &v).into_py(py);
+    }
+    py.None()
+}
+
+fn mysql_rows_to_py_list(py: Python<'_>, rows: &[MySqlRow]) -> PyResult<Py<PyAny>> {
+    let out = PyList::empty(py);
+    for r in rows {
+        let dict = PyDict::new(py);
+        for col in r.columns() {
+            let name = col.name();
+            dict.set_item(name, decode_col_mysql(py, r, name))?;
+        }
+        out.append(dict)?;
+    }
+    Ok(out.into())
+}
+
+fn bind_typed_mysql<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+    params: Vec<TypedParam>,
+) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    for p in params {
+        query = match p {
+            TypedParam::Null => query.bind(Option::<String>::None),
+            TypedParam::Bool(b) => query.bind(b),
+            TypedParam::Int(i) => query.bind(i),
+            TypedParam::Real(f) => query.bind(f),
+            TypedParam::Text(s) => query.bind(s),
+            TypedParam::Bytes(b) => query.bind(b),
+        };
+    }
+    query
+}
+
+#[pyclass]
+pub struct MySqlEngine {
+    pool: Arc<MySqlPool>,
+}
+
+#[pymethods]
+impl MySqlEngine {
+    #[staticmethod]
+    fn connect(py: Python<'_>, url: String) -> PyResult<&PyAny> {
+        future_into_py(py, async move {
+            let pool = MySqlPoolOptions::new()
+                .max_connections(20)
+                .connect(&url)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(MySqlEngine {
+                pool: Arc::new(pool),
+            })
+        })
+    }
+
+    fn close<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            pool.close().await;
+            Ok(())
+        })
+    }
+
+    fn fetch_many<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            let query = bind_typed_mysql(sqlx::query(&sql), typed_params);
+            let rows = query
+                .fetch_all(&*pool)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Python::with_gil(|py| mysql_rows_to_py_list(py, &rows))
+        })
+    }
+
+    fn execute<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            let query = bind_typed_mysql(sqlx::query(&sql), typed_params);
+            let result = query
+                .execute(&*pool)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(result.rows_affected())
+        })
+    }
+
+    fn execute_many<'p>(&self, py: Python<'p>, sql: String) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            use futures::TryStreamExt;
+            use sqlx::Executor;
+            let mut total: u64 = 0;
+            let mut stream = pool.execute_many(sqlx::raw_sql(&sql));
+            while let Some(result) = stream
+                .try_next()
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?
+            {
+                total += result.rows_affected();
+            }
+            Ok(total)
+        })
+    }
+
+    /// MySQL transactions — see :class:`Transaction` for the PG
+    /// equivalent. MySQL InnoDB is fine with concurrent transactions;
+    /// non-InnoDB tables silently drop the BEGIN.
+    fn begin<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            let tx = pool
+                .begin()
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(MySqlTransaction {
+                inner: Arc::new(TokioMutex::new(Some(tx))),
+            })
+        })
+    }
+}
+
+#[pyclass]
+pub struct MySqlTransaction {
+    inner: Arc<TokioMutex<Option<sqlx::Transaction<'static, sqlx::MySql>>>>,
+}
+
+#[pymethods]
+impl MySqlTransaction {
+    fn commit<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            if let Some(tx) = guard.take() {
+                tx.commit()
+                    .await
+                    .map_err(|e| PyException::new_err(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn rollback<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            if let Some(tx) = guard.take() {
+                tx.rollback()
+                    .await
+                    .map_err(|e| PyException::new_err(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn fetch_many<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PyException::new_err(
+                    "Transaction already committed or rolled back; cannot fetch_many",
+                )
+            })?;
+            let query = bind_typed_mysql(sqlx::query(&sql), typed_params);
+            let rows = query
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Python::with_gil(|py| mysql_rows_to_py_list(py, &rows))
+        })
+    }
+
+    fn execute<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PyException::new_err(
+                    "Transaction already committed or rolled back; cannot execute",
+                )
+            })?;
+            let query = bind_typed_mysql(sqlx::query(&sql), typed_params);
+            let result = query
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(result.rows_affected())
+        })
+    }
+
+    fn execute_many<'p>(&self, py: Python<'p>, sql: String) -> PyResult<&'p PyAny> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PyException::new_err(
+                    "Transaction already committed or rolled back; cannot execute_many",
+                )
+            })?;
+            use futures::TryStreamExt;
+            use sqlx::Executor;
+            let mut total: u64 = 0;
+            let mut stream = (&mut **tx).execute_many(sqlx::raw_sql(&sql));
+            while let Some(result) = stream
+                .try_next()
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?
+            {
+                total += result.rows_affected();
+            }
+            Ok(total)
+        })
+    }
 }
 
 #[pymodule]
@@ -755,6 +1153,9 @@ fn ormx_core(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_class::<Transaction>()?;
     m.add_class::<SqliteEngine>()?;
+    m.add_class::<SqliteTransaction>()?;
+    m.add_class::<MySqlEngine>()?;
+    m.add_class::<MySqlTransaction>()?;
     m.add_class::<Cluster>()?;
     m.add_class::<ShardingStrategyType>()?;
     m.add_class::<ShardingConfig>()?;
