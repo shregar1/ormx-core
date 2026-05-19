@@ -365,6 +365,44 @@ impl Engine {
             Ok(result.rows_affected())
         })
     }
+
+    /// Run a multi-statement SQL script via the Postgres simple-query
+    /// protocol.
+    ///
+    /// Unlike ``execute`` (which uses prepared statements + cannot
+    /// handle multiple commands in one call), this routes through
+    /// sqlx's ``raw_sql`` path — no Parse / Bind / Execute, just the
+    /// raw text sent to the server. That makes it the right primitive
+    /// for migration files (which mix CREATE TABLE / CREATE FUNCTION /
+    /// ALTER TABLE statements) and for any DDL that contains
+    /// dollar-quoted blocks (PL/pgSQL, JSON-with-semicolons in default
+    /// values, etc).
+    ///
+    /// No parameter binding — the simple-query protocol doesn't support
+    /// it. If you need bind parameters, use ``execute`` per-statement
+    /// instead.
+    fn execute_many<'p>(&self, py: Python<'p>, sql: String) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            use sqlx::Executor;
+            // ``execute_many`` returns a stream; we drain it for side
+            // effects + accumulate rows-affected. The transaction-
+            // boundary contract is the caller's: a Transaction-bound
+            // execute_many is naturally inside the tx; an Engine-
+            // bound one auto-commits each statement (Postgres default).
+            let mut total: u64 = 0;
+            let mut stream = pool.execute_many(sqlx::raw_sql(&sql));
+            use futures::TryStreamExt;
+            while let Some(result) = stream
+                .try_next()
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?
+            {
+                total += result.rows_affected();
+            }
+            Ok(total)
+        })
+    }
 }
 
 /// A live DB transaction.
@@ -457,6 +495,37 @@ impl Transaction {
                 .await
                 .map_err(|e| PyException::new_err(e.to_string()))?;
             Ok(result.rows_affected())
+        })
+    }
+
+    /// Multi-statement raw SQL inside the transaction.
+    ///
+    /// See ``Engine::execute_many`` for the rationale. Inside a
+    /// transaction this gets the additional benefit that the whole
+    /// script is rolled back atomically if any statement fails — which
+    /// is exactly what the migration runner wants when applying a
+    /// timestamp-prefixed file.
+    fn execute_many<'p>(&self, py: Python<'p>, sql: String) -> PyResult<&'p PyAny> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PyException::new_err(
+                    "Transaction already committed or rolled back; cannot execute_many",
+                )
+            })?;
+            use futures::TryStreamExt;
+            use sqlx::Executor;
+            let mut total: u64 = 0;
+            let mut stream = (&mut **tx).execute_many(sqlx::raw_sql(&sql));
+            while let Some(result) = stream
+                .try_next()
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?
+            {
+                total += result.rows_affected();
+            }
+            Ok(total)
         })
     }
 }
