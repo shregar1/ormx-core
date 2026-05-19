@@ -1,12 +1,20 @@
-use pyo3::exceptions::{PyException};
+use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_asyncio::tokio::future_into_py;
-use sqlx::{Row, Column, TypeInfo, postgres::{PgPool, PgPoolOptions}};
-use std::sync::Arc;
+use sqlx::{
+    postgres::{PgPool, PgPoolOptions, PgRow},
+    Column, Postgres, Row, TypeInfo,
+};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 
 pub mod logic;
+
+// ---------------------------------------------------------------------------
+// Parameter extraction / binding (shared by Engine + Transaction)
+// ---------------------------------------------------------------------------
 
 /// Typed parameter value extracted from a Python object once, so the async
 /// bind loop doesn't need to reacquire the GIL. Owned variants only — moved
@@ -43,10 +51,39 @@ fn extract_param(obj: &PyAny) -> PyResult<TypedParam> {
     Ok(TypedParam::Text(obj.str()?.to_str()?.to_owned()))
 }
 
+fn extract_params(py: Python<'_>, params: &[PyObject]) -> PyResult<Vec<TypedParam>> {
+    params
+        .iter()
+        .map(|p| extract_param(p.as_ref(py)))
+        .collect()
+}
+
+/// Bind a sequence of typed params onto a sqlx Query. Generic over the
+/// arguments type (`PgArguments`) so it works for both pool and tx queries.
+fn bind_typed<'q>(
+    mut query: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
+    params: Vec<TypedParam>,
+) -> sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments> {
+    for p in params {
+        query = match p {
+            TypedParam::Null => query.bind(Option::<String>::None),
+            TypedParam::Bool(b) => query.bind(b),
+            TypedParam::Int(i) => query.bind(i),
+            TypedParam::Real(f) => query.bind(f),
+            TypedParam::Text(s) => query.bind(s),
+        };
+    }
+    query
+}
+
+// ---------------------------------------------------------------------------
+// Row decoding
+// ---------------------------------------------------------------------------
+
 /// Decode one column of a row into a Python-native value, picking the right
 /// `try_get` once based on the column's declared SQL type. Falls back to a
 /// probe sequence for unrecognized types (TIMESTAMP, DECIMAL, UUID …).
-fn decode_col(py: Python<'_>, row: &sqlx::postgres::PgRow, name: &str, type_name: &str) -> Py<PyAny> {
+fn decode_col(py: Python<'_>, row: &PgRow, name: &str, type_name: &str) -> Py<PyAny> {
     // Postgres is strictly typed — try_get won't widen INT4→i64 the way
     // sqlx::Any did, so each PG numeric width gets its own arm and widens
     // explicitly on the Rust side.
@@ -97,6 +134,24 @@ fn decode_col(py: Python<'_>, row: &sqlx::postgres::PgRow, name: &str, type_name
     }
 }
 
+fn rows_to_py_list(py: Python<'_>, rows: &[PgRow]) -> PyResult<Py<PyAny>> {
+    let out = PyList::empty(py);
+    for r in rows {
+        let dict = PyDict::new(py);
+        for col in r.columns() {
+            let name = col.name();
+            let type_name = col.type_info().name();
+            dict.set_item(name, decode_col(py, r, name, type_name))?;
+        }
+        out.append(dict)?;
+    }
+    Ok(out.into())
+}
+
+// ---------------------------------------------------------------------------
+// Sharding (unchanged from previous revision)
+// ---------------------------------------------------------------------------
+
 #[pyclass]
 #[derive(Clone, Copy)]
 pub enum ShardingStrategyType {
@@ -142,10 +197,8 @@ impl ShardingConfig {
         let is_new = !self.range_map.contains_key(&upper_bound);
         self.range_map.insert(upper_bound, shard);
         if is_new {
-            // Maintain sorted invariant with a single insert at the correct
-            // position — no full re-sort.
             match self.range_sorted_keys.binary_search(&upper_bound) {
-                Ok(_) => {} // already present (shouldn't happen given the guard above)
+                Ok(_) => {}
                 Err(pos) => self.range_sorted_keys.insert(pos, upper_bound),
             }
         }
@@ -184,8 +237,7 @@ impl Cluster {
         }
     }
 
-    fn add_shard(&mut self, _name: String, _url: String) {
-    }
+    fn add_shard(&mut self, _name: String, _url: String) {}
 
     fn route(&self, py: Python<'_>, value: String) -> PyResult<String> {
         let config = &self.config;
@@ -196,7 +248,9 @@ impl Cluster {
                     let shard: String = res.extract(py)?;
                     Ok(shard)
                 } else {
-                    Err(PyException::new_err("Custom strategy selected but no callback provided"))
+                    Err(PyException::new_err(
+                        "Custom strategy selected but no callback provided",
+                    ))
                 }
             }
             ShardingStrategyType::Hash => {
@@ -214,6 +268,10 @@ impl Cluster {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Engine + Transaction
+// ---------------------------------------------------------------------------
 
 #[pyclass]
 pub struct Engine {
@@ -233,7 +291,37 @@ impl Engine {
                 .connect(&url)
                 .await
                 .map_err(|e| PyException::new_err(e.to_string()))?;
-            Ok(Engine { pool: Arc::new(pool) })
+            Ok(Engine {
+                pool: Arc::new(pool),
+            })
+        })
+    }
+
+    /// Close all pooled connections. Idempotent — safe to call repeatedly,
+    /// and a no-op once the pool's already closed.
+    fn close<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            pool.close().await;
+            Ok(())
+        })
+    }
+
+    /// Begin a transaction. Returns a [`Transaction`] handle that owns a
+    /// pooled connection until the user commits, rolls back, or drops it.
+    ///
+    /// Concurrent reads on the pool (other handlers) still get their own
+    /// connections — only this transaction's writes are isolated.
+    fn begin<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            let tx = pool
+                .begin()
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(Transaction {
+                inner: Arc::new(TokioMutex::new(Some(tx))),
+            })
         })
     }
 
@@ -244,46 +332,107 @@ impl Engine {
         params: Vec<PyObject>,
     ) -> PyResult<&'p PyAny> {
         // Extract typed params under the GIL we already hold — avoids
-        // reacquiring it inside the async block, and lets sqlx see real types
-        // (int → INT, bool → BOOL, etc.) instead of widening everything to
-        // TEXT the way the old `Vec<String>` signature did.
-        let typed_params: Vec<TypedParam> = params
-            .iter()
-            .map(|p| extract_param(p.as_ref(py)))
-            .collect::<PyResult<_>>()?;
-
+        // reacquiring it inside the async block.
+        let typed_params = extract_params(py, &params)?;
         let pool = self.pool.clone();
         future_into_py(py, async move {
-            let mut query = sqlx::query(&sql);
-            for p in typed_params {
-                query = match p {
-                    TypedParam::Null => query.bind(Option::<String>::None),
-                    TypedParam::Bool(b) => query.bind(b),
-                    TypedParam::Int(i) => query.bind(i),
-                    TypedParam::Real(f) => query.bind(f),
-                    TypedParam::Text(s) => query.bind(s),
-                };
-            }
+            let query = bind_typed(sqlx::query(&sql), typed_params);
             let rows = query
                 .fetch_all(&*pool)
                 .await
                 .map_err(|e| PyException::new_err(e.to_string()))?;
+            Python::with_gil(|py| rows_to_py_list(py, &rows))
+        })
+    }
 
-            // Build a Python `list[dict]` directly — no JSON encode here, no
-            // matching `json.loads()` on the Python side.
-            Python::with_gil(|py| -> PyResult<Py<PyAny>> {
-                let out = PyList::empty(py);
-                for r in &rows {
-                    let dict = PyDict::new(py);
-                    for col in r.columns() {
-                        let name = col.name();
-                        let type_name = col.type_info().name();
-                        dict.set_item(name, decode_col(py, r, name, type_name))?;
-                    }
-                    out.append(dict)?;
-                }
-                Ok(out.into())
-            })
+    /// Run an INSERT/UPDATE/DELETE/DDL statement. Returns the number of
+    /// rows affected (matches the contract the Python ``Query.update`` /
+    /// ``Query.delete`` methods rely on).
+    fn execute<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            let query = bind_typed(sqlx::query(&sql), typed_params);
+            let result = query
+                .execute(&*pool)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(result.rows_affected())
+        })
+    }
+}
+
+/// A live DB transaction.
+///
+/// Wraps a ``sqlx::Transaction<'static, Postgres>`` inside an ``Arc<Mutex<…>>``
+/// so it can move across the PyO3 boundary and be operated on from
+/// concurrent async code (the GIL serializes Python-side access, but
+/// the underlying transaction may be touched from multiple `await`
+/// points within a handler). Once committed or rolled back the inner
+/// `Option` becomes `None`; subsequent calls are no-ops rather than
+/// panics, so the Python `__aexit__` cleanup path can't bite users.
+#[pyclass]
+pub struct Transaction {
+    inner: Arc<TokioMutex<Option<sqlx::Transaction<'static, Postgres>>>>,
+}
+
+#[pymethods]
+impl Transaction {
+    /// Commit the transaction. If already committed/rolled back, returns
+    /// immediately — making the Python context-manager cleanup idempotent.
+    fn commit<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            if let Some(tx) = guard.take() {
+                tx.commit()
+                    .await
+                    .map_err(|e| PyException::new_err(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Roll back the transaction. Idempotent — same contract as `commit`.
+    fn rollback<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            if let Some(tx) = guard.take() {
+                tx.rollback()
+                    .await
+                    .map_err(|e| PyException::new_err(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn fetch_many<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PyException::new_err(
+                    "Transaction already committed or rolled back; cannot fetch_many",
+                )
+            })?;
+            let query = bind_typed(sqlx::query(&sql), typed_params);
+            let rows = query
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Python::with_gil(|py| rows_to_py_list(py, &rows))
         })
     }
 
@@ -293,28 +442,21 @@ impl Engine {
         sql: String,
         params: Vec<PyObject>,
     ) -> PyResult<&'p PyAny> {
-        let typed_params: Vec<TypedParam> = params
-            .iter()
-            .map(|p| extract_param(p.as_ref(py)))
-            .collect::<PyResult<_>>()?;
-
-        let pool = self.pool.clone();
+        let typed_params = extract_params(py, &params)?;
+        let inner = self.inner.clone();
         future_into_py(py, async move {
-            let mut query = sqlx::query(&sql);
-            for p in typed_params {
-                query = match p {
-                    TypedParam::Null => query.bind(Option::<String>::None),
-                    TypedParam::Bool(b) => query.bind(b),
-                    TypedParam::Int(i) => query.bind(i),
-                    TypedParam::Real(f) => query.bind(f),
-                    TypedParam::Text(s) => query.bind(s),
-                };
-            }
-            query
-                .execute(&*pool)
+            let mut guard = inner.lock().await;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PyException::new_err(
+                    "Transaction already committed or rolled back; cannot execute",
+                )
+            })?;
+            let query = bind_typed(sqlx::query(&sql), typed_params);
+            let result = query
+                .execute(&mut **tx)
                 .await
                 .map_err(|e| PyException::new_err(e.to_string()))?;
-            Ok(())
+            Ok(result.rows_affected())
         })
     }
 }
@@ -322,6 +464,7 @@ impl Engine {
 #[pymodule]
 fn ormx_core(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Engine>()?;
+    m.add_class::<Transaction>()?;
     m.add_class::<Cluster>()?;
     m.add_class::<ShardingStrategyType>()?;
     m.add_class::<ShardingConfig>()?;
