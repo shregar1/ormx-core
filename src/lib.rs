@@ -575,10 +575,186 @@ impl Transaction {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SQLite backend
+// ---------------------------------------------------------------------------
+//
+// Mirror of ``Engine`` for ``sqlx::Sqlite``. We keep PG + SQLite as
+// separate PyClasses (rather than a generic-over-backend ``Engine``)
+// because:
+//
+//   1. PyO3 doesn't play well with generic ``#[pyclass]`` types — each
+//      monomorphisation needs its own ``#[pyclass]`` entry.
+//   2. The two backends have noticeably different type-decode paths
+//      (SQLite has no BYTEA, no JSONB, no TIMESTAMPTZ, no NUMERIC).
+//   3. URL-based dispatch is a four-line check in the Python wrapper.
+//
+// Most of the Engine impl is structurally identical; the row-decode
+// path and the placeholder syntax differ. Bind params use ``?1``,
+// ``?2``, etc. for SQLite (the Python ``get_placeholder`` already
+// switches by dialect — that side is unchanged).
+
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
+
+fn decode_col_sqlite(py: Python<'_>, row: &SqliteRow, name: &str) -> Py<PyAny> {
+    // SQLite is dynamically typed: every column has a "declared" type
+    // but the actual storage class is one of INTEGER / REAL / TEXT /
+    // BLOB / NULL. Probe order matters:
+    //
+    //  1. Integer (the most common case for IDs)
+    //  2. Float
+    //  3. Bool (would normally lose to integer, but sqlx maps the
+    //     "BOOLEAN" declared type through directly when present)
+    //  4. **String BEFORE Vec<u8>** — sqlx's ``try_get::<String>``
+    //     succeeds on TEXT storage AND fails cleanly on BLOB (it
+    //     validates UTF-8). If we tried Vec<u8> first, every TEXT
+    //     column would come back as ``bytes`` because BLOB storage
+    //     accepts anything.
+    //  5. Vec<u8> for actual BLOB.
+    if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(name) {
+        return v.into_py(py);
+    }
+    if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(name) {
+        return v.into_py(py);
+    }
+    if let Ok(Some(v)) = row.try_get::<Option<bool>, _>(name) {
+        return v.into_py(py);
+    }
+    if let Ok(Some(v)) = row.try_get::<Option<String>, _>(name) {
+        return v.into_py(py);
+    }
+    if let Ok(Some(v)) = row.try_get::<Option<Vec<u8>>, _>(name) {
+        return pyo3::types::PyBytes::new(py, &v).into_py(py);
+    }
+    py.None()
+}
+
+fn sqlite_rows_to_py_list(py: Python<'_>, rows: &[SqliteRow]) -> PyResult<Py<PyAny>> {
+    let out = PyList::empty(py);
+    for r in rows {
+        let dict = PyDict::new(py);
+        for col in r.columns() {
+            let name = col.name();
+            dict.set_item(name, decode_col_sqlite(py, r, name))?;
+        }
+        out.append(dict)?;
+    }
+    Ok(out.into())
+}
+
+fn bind_typed_sqlite<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    params: Vec<TypedParam>,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    for p in params {
+        query = match p {
+            TypedParam::Null => query.bind(Option::<String>::None),
+            TypedParam::Bool(b) => query.bind(b),
+            TypedParam::Int(i) => query.bind(i),
+            TypedParam::Real(f) => query.bind(f),
+            TypedParam::Text(s) => query.bind(s),
+            TypedParam::Bytes(b) => query.bind(b),
+        };
+    }
+    query
+}
+
+#[pyclass]
+pub struct SqliteEngine {
+    pool: Arc<SqlitePool>,
+}
+
+#[pymethods]
+impl SqliteEngine {
+    #[staticmethod]
+    fn connect(py: Python<'_>, url: String) -> PyResult<&PyAny> {
+        future_into_py(py, async move {
+            // ``SqliteConnectOptions::from_str`` parses both ``sqlite::memory:``
+            // and ``sqlite:///path/to/file.db`` forms. ``create_if_missing``
+            // mirrors the typical sqlx setup for local-dev convenience.
+            let opts: SqliteConnectOptions = url
+                .parse::<SqliteConnectOptions>()
+                .map_err(|e| PyException::new_err(e.to_string()))?
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(8)
+                .connect_with(opts)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(SqliteEngine {
+                pool: Arc::new(pool),
+            })
+        })
+    }
+
+    fn close<'p>(&self, py: Python<'p>) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            pool.close().await;
+            Ok(())
+        })
+    }
+
+    fn fetch_many<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            let query = bind_typed_sqlite(sqlx::query(&sql), typed_params);
+            let rows = query
+                .fetch_all(&*pool)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Python::with_gil(|py| sqlite_rows_to_py_list(py, &rows))
+        })
+    }
+
+    fn execute<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<PyObject>,
+    ) -> PyResult<&'p PyAny> {
+        let typed_params = extract_params(py, &params)?;
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            let query = bind_typed_sqlite(sqlx::query(&sql), typed_params);
+            let result = query
+                .execute(&*pool)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            Ok(result.rows_affected())
+        })
+    }
+
+    fn execute_many<'p>(&self, py: Python<'p>, sql: String) -> PyResult<&'p PyAny> {
+        let pool = self.pool.clone();
+        future_into_py(py, async move {
+            use futures::TryStreamExt;
+            use sqlx::Executor;
+            let mut total: u64 = 0;
+            let mut stream = pool.execute_many(sqlx::raw_sql(&sql));
+            while let Some(result) = stream
+                .try_next()
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?
+            {
+                total += result.rows_affected();
+            }
+            Ok(total)
+        })
+    }
+}
+
 #[pymodule]
 fn ormx_core(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_class::<Transaction>()?;
+    m.add_class::<SqliteEngine>()?;
     m.add_class::<Cluster>()?;
     m.add_class::<ShardingStrategyType>()?;
     m.add_class::<ShardingConfig>()?;
