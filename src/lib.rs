@@ -26,6 +26,9 @@ enum TypedParam {
     Int(i64),
     Real(f64),
     Text(String),
+    /// Raw bytes — binds as ``BYTEA``. Previously these fell through to
+    /// ``obj.str()`` (TEXT), silently corrupting non-UTF-8 binary data.
+    Bytes(Vec<u8>),
 }
 
 fn extract_param(obj: &PyAny) -> PyResult<TypedParam> {
@@ -42,6 +45,14 @@ fn extract_param(obj: &PyAny) -> PyResult<TypedParam> {
     }
     if let Ok(f) = obj.extract::<f64>() {
         return Ok(TypedParam::Real(f));
+    }
+    // ``bytes`` BEFORE ``str`` — PyO3's ``extract::<String>`` doesn't try
+    // bytes, so the order matters only for clarity here. The check IS
+    // needed because the old fallthrough (``obj.str()``) would call
+    // ``str()`` on a ``bytes`` and produce ``"b'\\x00\\x01...'"`` — visibly
+    // wrong on the wire.
+    if let Ok(b) = obj.extract::<&[u8]>() {
+        return Ok(TypedParam::Bytes(b.to_vec()));
     }
     if let Ok(s) = obj.extract::<String>() {
         return Ok(TypedParam::Text(s));
@@ -71,6 +82,7 @@ fn bind_typed<'q>(
             TypedParam::Int(i) => query.bind(i),
             TypedParam::Real(f) => query.bind(f),
             TypedParam::Text(s) => query.bind(s),
+            TypedParam::Bytes(b) => query.bind(b),
         };
     }
     query
@@ -114,6 +126,12 @@ fn decode_col(py: Python<'_>, row: &PgRow, name: &str, type_name: &str) -> Py<Py
             .ok()
             .flatten()
             .into_py(py),
+        "BYTEA" => row
+            .try_get::<Option<Vec<u8>>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| pyo3::types::PyBytes::new(py, &v).into_py(py))
+            .unwrap_or_else(|| py.None()),
         _ => {
             // Slow path for unrecognised types (TIMESTAMP, NUMERIC, UUID, JSONB…).
             // Widen to String last so date/uuid/etc surface as ISO strings.
@@ -223,7 +241,10 @@ impl ShardingConfig {
 
 #[pyclass]
 pub struct Cluster {
-    pools: Arc<HashMap<String, PgPool>>,
+    // ``Mutex`` so ``add_shard`` can mutate after construction. The
+    // pool registry is read on every ``route()`` call — usually after
+    // every shard has been added, so contention is effectively zero.
+    pools: Arc<std::sync::Mutex<HashMap<String, PgPool>>>,
     config: ShardingConfig,
 }
 
@@ -232,12 +253,35 @@ impl Cluster {
     #[new]
     fn new(config: ShardingConfig) -> Self {
         Cluster {
-            pools: Arc::new(HashMap::new()),
+            pools: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config,
         }
     }
 
-    fn add_shard(&mut self, _name: String, _url: String) {}
+    /// Connect to ``url`` and register the resulting pool under ``name``.
+    ///
+    /// Was a no-op stub since the original implementation — this is
+    /// what makes the sharding feature actually do something. The
+    /// pool is created with the same defaults as ``Engine::connect``;
+    /// for finer control, build the ``Engine`` separately and shove
+    /// it into the registry via a future ``add_engine`` method.
+    fn add_shard<'p>(
+        &mut self,
+        py: Python<'p>,
+        name: String,
+        url: String,
+    ) -> PyResult<&'p PyAny> {
+        let pools = self.pools.clone();
+        future_into_py(py, async move {
+            let pool = PgPoolOptions::new()
+                .max_connections(20)
+                .connect(&url)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+            pools.lock().unwrap().insert(name, pool);
+            Ok(())
+        })
+    }
 
     fn route(&self, py: Python<'_>, value: String) -> PyResult<String> {
         let config = &self.config;
@@ -254,7 +298,8 @@ impl Cluster {
                 }
             }
             ShardingStrategyType::Hash => {
-                let shards: Vec<String> = self.pools.keys().cloned().collect();
+                let shards: Vec<String> =
+                    self.pools.lock().unwrap().keys().cloned().collect();
                 Ok(logic::route_hash(&value, &shards))
             }
             ShardingStrategyType::Geo => Ok(logic::route_geo(&value, &config.geo_map)),
