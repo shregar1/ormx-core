@@ -1,4 +1,5 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use std::net::IpAddr;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -42,6 +43,10 @@ enum TypedParam {
     /// ``operator does not exist: date = text``.
     Date(NaiveDate),
     DateTime(DateTime<Utc>),
+    /// PG ``INET`` column. Pre-fix a string-shaped IP fell through to
+    /// ``TypedParam::Text`` and PG rejected it with
+    /// ``column "ip_address" is of type inet but expression is of type text``.
+    Inet(IpAddr),
 }
 
 fn try_extract_json(py: Python<'_>, obj: &PyAny) -> Option<serde_json::Value> {
@@ -199,6 +204,13 @@ fn extract_param(obj: &PyAny) -> PyResult<TypedParam> {
         if let Ok(u) = uuid::Uuid::parse_str(&s) {
             return Ok(TypedParam::Uuid(u));
         }
+        // IP address probe — strings shaped like ``127.0.0.1`` / ``::1`` get
+        // bound as INET so PG's strictly-typed inet columns accept them.
+        // Probe AFTER UUID so a stray address-like UUID doesn't get
+        // mis-routed.
+        if let Ok(ip) = s.parse::<IpAddr>() {
+            return Ok(TypedParam::Inet(ip));
+        }
         return Ok(TypedParam::Text(s));
     }
     // Python ``uuid.UUID`` and other types with a canonical string form.
@@ -235,6 +247,7 @@ fn bind_typed<'q>(
             TypedParam::Time(t) => query.bind(t),
             TypedParam::Date(d) => query.bind(d),
             TypedParam::DateTime(dt) => query.bind(dt),
+            TypedParam::Inet(ip) => query.bind(ip),
         };
     }
     query
@@ -328,6 +341,12 @@ fn decode_col(py: Python<'_>, row: &PgRow, name: &str, type_name: &str) -> Py<Py
             .ok()
             .flatten()
             .map(|v| date_to_py(py, v))
+            .unwrap_or_else(|| py.None()),
+        "INET" | "CIDR" => row
+            .try_get::<Option<IpAddr>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| v.to_string().into_py(py))
             .unwrap_or_else(|| py.None()),
         "TIME" => row
             .try_get::<Option<NaiveTime>, _>(name)
@@ -878,6 +897,8 @@ fn bind_typed_sqlite<'q>(
             TypedParam::Time(t) => query.bind(t),
             TypedParam::Date(d) => query.bind(d),
             TypedParam::DateTime(dt) => query.bind(dt),
+            // SQLite has no native INET — store the canonical string form.
+            TypedParam::Inet(ip) => query.bind(ip.to_string()),
         };
     }
     query
@@ -1166,6 +1187,8 @@ fn bind_typed_mysql<'q>(
             TypedParam::Time(t) => query.bind(t),
             TypedParam::Date(d) => query.bind(d),
             TypedParam::DateTime(dt) => query.bind(dt),
+            // MySQL has no INET type — bind the canonical string form.
+            TypedParam::Inet(ip) => query.bind(ip.to_string()),
         };
     }
     query
