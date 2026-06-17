@@ -1,9 +1,11 @@
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_asyncio::tokio::future_into_py;
 use sqlx::{
     postgres::{PgPool, PgPoolOptions, PgRow},
+    types::Json as SqlxJson,
     Column, Postgres, Row, TypeInfo,
 };
 use std::collections::HashMap;
@@ -11,6 +13,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 pub mod logic;
+pub mod migrate;
+pub mod migrate_runner;
 
 // ---------------------------------------------------------------------------
 // Parameter extraction / binding (shared by Engine + Transaction)
@@ -29,11 +33,148 @@ enum TypedParam {
     /// Raw bytes — binds as ``BYTEA``. Previously these fell through to
     /// ``obj.str()`` (TEXT), silently corrupting non-UTF-8 binary data.
     Bytes(Vec<u8>),
+    Uuid(uuid::Uuid),
+    Json(serde_json::Value),
+    Time(NaiveTime),
+    /// Calendar date (no time component). Bound as PG ``DATE`` — without
+    /// this variant a Python ``datetime.date`` falls through to
+    /// ``obj.str()`` and binds as TEXT, which PG rejects with
+    /// ``operator does not exist: date = text``.
+    Date(NaiveDate),
+    DateTime(DateTime<Utc>),
+}
+
+fn try_extract_json(py: Python<'_>, obj: &PyAny) -> Option<serde_json::Value> {
+    if !(obj.is_instance_of::<pyo3::types::PyList>()
+        || obj.is_instance_of::<pyo3::types::PyDict>()
+        || obj.is_instance_of::<pyo3::types::PyTuple>())
+    {
+        return None;
+    }
+    let json_mod = py.import("json").ok()?;
+    let dumped: String = json_mod.call_method1("dumps", (obj,)).ok()?.extract().ok()?;
+    serde_json::from_str(&dumped).ok()
+}
+
+fn try_extract_datetime(py: Python<'_>, obj: &PyAny) -> Option<DateTime<Utc>> {
+    let dt_mod = py.import("datetime").ok()?;
+    let datetime_type = dt_mod.getattr("datetime").ok()?;
+    if !obj.is_instance(datetime_type).ok()? {
+        return None;
+    }
+    let ts: f64 = obj.call_method0("timestamp").ok()?.extract().ok()?;
+    let secs = ts.trunc() as i64;
+    let nanos = ((ts.fract()) * 1_000_000_000.0).round() as u32;
+    DateTime::from_timestamp(secs, nanos)
+}
+
+fn try_extract_date(py: Python<'_>, obj: &PyAny) -> Option<NaiveDate> {
+    // ``datetime.date`` is a parent class of ``datetime.datetime``, so this
+    // check has to run AFTER ``try_extract_datetime`` to avoid pulling
+    // datetimes in as bare dates and dropping the time component.
+    let dt_mod = py.import("datetime").ok()?;
+    let date_type = dt_mod.getattr("date").ok()?;
+    if !obj.is_instance(date_type).ok()? {
+        return None;
+    }
+    let year: i32 = obj.getattr("year").ok()?.extract().ok()?;
+    let month: u32 = obj.getattr("month").ok()?.extract().ok()?;
+    let day: u32 = obj.getattr("day").ok()?.extract().ok()?;
+    NaiveDate::from_ymd_opt(year, month, day)
+}
+
+fn date_to_py(py: Python<'_>, value: NaiveDate) -> Py<PyAny> {
+    let dt_mod = py.import("datetime").expect("datetime module");
+    let date_type = dt_mod.getattr("date").expect("datetime.date");
+    use chrono::Datelike;
+    date_type
+        .call1((value.year(), value.month(), value.day()))
+        .expect("datetime.date constructor")
+        .into_py(py)
+}
+
+fn datetime_to_py(py: Python<'_>, value: DateTime<Utc>) -> Py<PyAny> {
+    // Round-trip via ``fromisoformat`` so the resulting Python object is
+    // a real ``datetime.datetime`` with ``tzinfo == datetime.timezone.utc``,
+    // not a ``chrono``-tagged opaque.
+    let dt_mod = py.import("datetime").expect("datetime module");
+    let datetime_type = dt_mod.getattr("datetime").expect("datetime.datetime");
+    let iso = value.format("%Y-%m-%dT%H:%M:%S%.f+00:00").to_string();
+    datetime_type
+        .call_method1("fromisoformat", (iso,))
+        .expect("datetime.fromisoformat")
+        .into_py(py)
+}
+
+fn uuid_to_py(py: Python<'_>, value: uuid::Uuid) -> Py<PyAny> {
+    let uuid_mod = py.import("uuid").expect("stdlib uuid module");
+    uuid_mod
+        .call_method1("UUID", (value.to_string(),))
+        .expect("uuid.UUID constructor")
+        .into_py(py)
+}
+
+fn json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> Py<PyAny> {
+    match value {
+        serde_json::Value::Null => py.None(),
+        serde_json::Value::Bool(b) => b.into_py(py),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_py(py)
+            } else if let Some(f) = n.as_f64() {
+                f.into_py(py)
+            } else {
+                n.to_string().into_py(py)
+            }
+        }
+        serde_json::Value::String(s) => s.into_py(py),
+        serde_json::Value::Array(arr) => {
+            let list = PyList::empty(py);
+            for item in arr {
+                list.append(json_value_to_py(py, item)).expect("json array append");
+            }
+            list.into_py(py)
+        }
+        serde_json::Value::Object(map) => {
+            let dict = PyDict::new(py);
+            for (k, v) in map {
+                dict.set_item(k, json_value_to_py(py, v))
+                    .expect("json object set_item");
+            }
+            dict.into_py(py)
+        }
+    }
+}
+
+fn try_extract_time(py: Python<'_>, obj: &PyAny) -> Option<NaiveTime> {
+    let time_type = py.import("datetime").ok()?.getattr("time").ok()?;
+    if !obj.is_instance(time_type).ok()? {
+        return None;
+    }
+    let hour: u32 = obj.getattr("hour").ok()?.extract().ok()?;
+    let minute: u32 = obj.getattr("minute").ok()?.extract().ok()?;
+    let second: u32 = obj.getattr("second").ok()?.extract().ok()?;
+    NaiveTime::from_hms_opt(hour, minute, second)
 }
 
 fn extract_param(obj: &PyAny) -> PyResult<TypedParam> {
     if obj.is_none() {
         return Ok(TypedParam::Null);
+    }
+    if let Some(json_val) = Python::with_gil(|py| try_extract_json(py, obj)) {
+        return Ok(TypedParam::Json(json_val));
+    }
+    if let Some(time_val) = Python::with_gil(|py| try_extract_time(py, obj)) {
+        return Ok(TypedParam::Time(time_val));
+    }
+    // datetime BEFORE date — ``datetime.datetime`` is also a ``datetime.date``
+    // instance, so the wider check has to go last or every datetime would
+    // bind as a bare date (losing time + tz).
+    if let Some(dt_val) = Python::with_gil(|py| try_extract_datetime(py, obj)) {
+        return Ok(TypedParam::DateTime(dt_val));
+    }
+    if let Some(d_val) = Python::with_gil(|py| try_extract_date(py, obj)) {
+        return Ok(TypedParam::Date(d_val));
     }
     // bool BEFORE int — Python bools are an int subclass and would otherwise
     // coerce to 0/1.
@@ -55,11 +196,17 @@ fn extract_param(obj: &PyAny) -> PyResult<TypedParam> {
         return Ok(TypedParam::Bytes(b.to_vec()));
     }
     if let Ok(s) = obj.extract::<String>() {
+        if let Ok(u) = uuid::Uuid::parse_str(&s) {
+            return Ok(TypedParam::Uuid(u));
+        }
         return Ok(TypedParam::Text(s));
     }
-    // Decimal, datetime, UUID, etc. fall through here. str() gives a sensible
-    // wire-format the server can cast (ISO 8601, decimal string, hex UUID).
-    Ok(TypedParam::Text(obj.str()?.to_str()?.to_owned()))
+    // Python ``uuid.UUID`` and other types with a canonical string form.
+    let as_str = obj.str()?.to_str()?.to_owned();
+    if let Ok(u) = uuid::Uuid::parse_str(&as_str) {
+        return Ok(TypedParam::Uuid(u));
+    }
+    Ok(TypedParam::Text(as_str))
 }
 
 fn extract_params(py: Python<'_>, params: &[PyObject]) -> PyResult<Vec<TypedParam>> {
@@ -83,6 +230,11 @@ fn bind_typed<'q>(
             TypedParam::Real(f) => query.bind(f),
             TypedParam::Text(s) => query.bind(s),
             TypedParam::Bytes(b) => query.bind(b),
+            TypedParam::Uuid(u) => query.bind(u),
+            TypedParam::Json(v) => query.bind(SqlxJson(v)),
+            TypedParam::Time(t) => query.bind(t),
+            TypedParam::Date(d) => query.bind(d),
+            TypedParam::DateTime(dt) => query.bind(dt),
         };
     }
     query
@@ -131,6 +283,67 @@ fn decode_col(py: Python<'_>, row: &PgRow, name: &str, type_name: &str) -> Py<Py
             .ok()
             .flatten()
             .map(|v| pyo3::types::PyBytes::new(py, &v).into_py(py))
+            .unwrap_or_else(|| py.None()),
+        "UUID" => row
+            .try_get::<Option<uuid::Uuid>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| uuid_to_py(py, v))
+            .unwrap_or_else(|| py.None()),
+        "JSON" | "JSONB" => row
+            .try_get::<Option<SqlxJson<serde_json::Value>>, _>(name)
+            .ok()
+            .flatten()
+            .map(|SqlxJson(v)| json_value_to_py(py, &v))
+            .unwrap_or_else(|| py.None()),
+        "TIMESTAMP" => row
+            .try_get::<Option<NaiveDateTime>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| {
+                let dt_mod = py.import("datetime").expect("datetime module");
+                let datetime_type = dt_mod.getattr("datetime").expect("datetime.datetime");
+                datetime_type
+                    .call_method1(
+                        "fromisoformat",
+                        (v.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),),
+                    )
+                    .expect("datetime.fromisoformat")
+                    .into_py(py)
+            })
+            .unwrap_or_else(|| py.None()),
+        // TIMESTAMPTZ — sqlx maps this to ``DateTime<Utc>``. Decoding it
+        // as ``NaiveDateTime`` (the old path) silently fails inside
+        // ``try_get``, returning None for every populated row. This was
+        // Ship-stopper 1 for the ArchX downstream — every TIMESTAMPTZ
+        // column read back as None even when the DB row had data.
+        "TIMESTAMPTZ" => row
+            .try_get::<Option<DateTime<Utc>>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| datetime_to_py(py, v))
+            .unwrap_or_else(|| py.None()),
+        "DATE" => row
+            .try_get::<Option<NaiveDate>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| date_to_py(py, v))
+            .unwrap_or_else(|| py.None()),
+        "TIME" => row
+            .try_get::<Option<NaiveTime>, _>(name)
+            .ok()
+            .flatten()
+            .map(|v| {
+                let dt_mod = py.import("datetime").expect("datetime module");
+                let time_type = dt_mod.getattr("time").expect("datetime.time");
+                time_type
+                    .call_method1(
+                        "fromisoformat",
+                        (v.format("%H:%M:%S%.f").to_string(),),
+                    )
+                    .expect("datetime.time.fromisoformat")
+                    .into_py(py)
+            })
             .unwrap_or_else(|| py.None()),
         _ => {
             // Slow path for unrecognised types (TIMESTAMP, NUMERIC, UUID, JSONB…).
@@ -321,6 +534,12 @@ impl Cluster {
 #[pyclass]
 pub struct Engine {
     pool: Arc<PgPool>,
+}
+
+impl Engine {
+    pub(crate) fn pg_pool(&self) -> Arc<PgPool> {
+        self.pool.clone()
+    }
 }
 
 #[pymethods]
@@ -654,6 +873,11 @@ fn bind_typed_sqlite<'q>(
             TypedParam::Real(f) => query.bind(f),
             TypedParam::Text(s) => query.bind(s),
             TypedParam::Bytes(b) => query.bind(b),
+            TypedParam::Uuid(u) => query.bind(u),
+            TypedParam::Json(v) => query.bind(SqlxJson(v)),
+            TypedParam::Time(t) => query.bind(t),
+            TypedParam::Date(d) => query.bind(d),
+            TypedParam::DateTime(dt) => query.bind(dt),
         };
     }
     query
@@ -937,6 +1161,11 @@ fn bind_typed_mysql<'q>(
             TypedParam::Real(f) => query.bind(f),
             TypedParam::Text(s) => query.bind(s),
             TypedParam::Bytes(b) => query.bind(b),
+            TypedParam::Uuid(u) => query.bind(u),
+            TypedParam::Json(v) => query.bind(SqlxJson(v)),
+            TypedParam::Time(t) => query.bind(t),
+            TypedParam::Date(d) => query.bind(d),
+            TypedParam::DateTime(dt) => query.bind(dt),
         };
     }
     query
@@ -1159,5 +1388,6 @@ fn ormx_core(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Cluster>()?;
     m.add_class::<ShardingStrategyType>()?;
     m.add_class::<ShardingConfig>()?;
+    migrate::register(m)?;
     Ok(())
 }
