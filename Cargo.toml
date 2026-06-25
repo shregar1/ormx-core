@@ -3,6 +3,10 @@ name = "ormx-core"
 version = "0.5.2"
 edition = "2021"
 
+[workspace]
+members = ["ormx-migrate"]
+resolver = "2"
+
 [lib]
 name = "ormx_core"
 crate-type = ["cdylib", "rlib"]
@@ -34,7 +38,7 @@ thiserror = "1.0"
 tracing = "0.1"
 futures = "0.3"
 md5 = "0.7"
-ormx-migrate = { path = "../ormx-migrate" }
+ormx-migrate = { path = "ormx-migrate" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

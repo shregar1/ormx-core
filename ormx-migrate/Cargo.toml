@@ -1,0 +1,14 @@
+[package]
+name = "ormx-migrate"
+version = "0.2.2"
+edition = "2021"
+description = "Universal ORMX SQL migration discovery, DML helpers, and state DDL"
+license = "MIT"
+repository = "https://github.com/shregar1/ormx-migrate"
+readme = "README.md"
+
+[dependencies]
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"
